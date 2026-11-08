@@ -42,7 +42,7 @@ from game import Action, AgentConfig, HandResult, Observation, Street
 warmup()
 
 PARTICIPANT = "DataDrivenPoker"
-AGENT_NAME = "OmahaShortDeckMaster"
+AGENT_NAME = "OmahaShortDeckV3"
 
 
 # ===== YOUR CODE HERE =====
@@ -208,6 +208,11 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     if hand_strength >= 0.60:
         if to_call == 0 and Action.RAISE_HALF in legal:
             return Action.RAISE_HALF
+        # A draw or non-nut made hand should clear a higher equity bar when
+        # calling a bet. V2 called every hand in this strength band.
+        if to_call > 0 and hand_strength < 0.80:
+            if estimate_equity(obs) < max(0.50, pot_odds + 0.12):
+                return Action.FOLD
         if Action.CHECK_CALL in legal:
             return Action.CHECK_CALL
 
