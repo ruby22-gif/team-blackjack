@@ -29,12 +29,13 @@ agent.py - High-Performance Short Deck PLO5 Agent
 import os
 import random
 import traceback
+from itertools import combinations
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from evaluator import card_rank, card_suit, cards_to_str, omaha_score, warmup
+from evaluator import card_rank, card_suit, cards_to_str, get_table, omaha_score, warmup
 from game import Action, AgentConfig, HandResult, Observation, Street
 
 # Perform heavy warm-up during startup
@@ -111,49 +112,55 @@ def evaluate_postflop(obs: Observation):
     hole = obs.hole_cards
     board = obs.board
     
-    # On the river or when board is complete, use exact omaha_score
+    # Classify the best *legal* current hand: exactly two hole cards and
+    # exactly three visible board cards, even on the flop and turn.
     if len(board) == 5:
         my_score = omaha_score(hole, board)
-        # Category stored in upper bits (bits 20+)
-        cat = my_score >> 20
-        # Categories: 0:High, 1:Pair, 2:TwoPair, 3:Straight, 4:Trips, 5:FullHouse, 6:Flush, 7:Quads, 8:StraightFlush
-        strength_map = {0: 0.1, 1: 0.25, 2: 0.45, 3: 0.65, 4: 0.75, 5: 0.85, 6: 0.92, 7: 0.98, 8: 1.0}
-        return strength_map.get(cat, 0.3)
-    
-    # Flop / Turn Heuristic Assessment
+    else:
+        table = get_table()
+        hole_pairs = [((1 << a) | (1 << b)) for a, b in combinations(hole, 2)]
+        board_triples = [((1 << a) | (1 << b) | (1 << c))
+                         for a, b, c in combinations(board, 3)]
+        my_score = max(table[hm | bm] for hm in hole_pairs for bm in board_triples)
+
+    cat = my_score >> 20
+    strength_map = {0: 0.1, 1: 0.25, 2: 0.45, 3: 0.65, 4: 0.75,
+                    5: 0.85, 6: 0.92, 7: 0.98, 8: 1.0}
+    strength = strength_map.get(cat, 0.3)
+    if len(board) == 5:
+        return strength
+
+    # A flush draw needs two suited hole cards and two visible suited board cards.
     suit_counts_board = _suit_histogram(board)
     suit_counts_hole = _suit_histogram(hole)
-    
-    flush_draw = False
     for suit in range(4):
         if suit_counts_hole[suit] >= 2 and suit_counts_board[suit] >= 2:
-            flush_draw = True
-            break
-
-    rank_counts_combined = _rank_histogram(hole + board)
-    trips_or_better = any(cnt >= 3 for cnt in rank_counts_combined)
-    pairs_count = sum(1 for cnt in rank_counts_combined if cnt == 2)
-
-    strength = 0.3
-    if trips_or_better:
-        strength = 0.75
-    elif pairs_count >= 2:
-        strength = 0.55
-    elif pairs_count == 1:
-        strength = 0.40
-
-    if flush_draw:
-        strength = max(strength, 0.70)
+            strength = max(strength, 0.70)
 
     return strength
 
 
+def estimate_equity(obs: Observation, samples: int = 32) -> float:
+    """Bounded showdown estimate versus a random unseen five-card hand."""
+    hole, board = obs.hole_cards, obs.board
+    known = set(hole + board)
+    unseen = [card for card in range(36) if card not in known]
+    seed = obs.hand_index * 1315423911 + len(obs.action_history) * 2654435761
+    seed += sum((i + 1) * (card + 1) * 101 for i, card in enumerate(hole + board))
+    rng = random.Random(seed)
+    wins = 0.0
+    for _ in range(samples):
+        drawn = rng.sample(unseen, 10 - len(board))
+        opp_hole = drawn[:5]
+        full_board = board + tuple(drawn[5:])
+        mine = omaha_score(hole, full_board)
+        theirs = omaha_score(opp_hole, full_board)
+        wins += 1.0 if mine > theirs else 0.5 if mine == theirs else 0.0
+    return wins / samples
+
+
 def new_half(config: AgentConfig, memory: dict) -> None:
-    """Initialize opponent tracking and statistics for the half-match."""
-    memory["hands_played"] = 0
-    memory["opp_folds"] = 0
-    memory["opp_raises"] = 0
-    memory["opp_calls"] = 0
+    """The strategy keeps no state between hands."""
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
@@ -189,11 +196,6 @@ def choose_action(obs: Observation, memory: dict) -> Action:
     # 2. Postflop Decision Logic (Flop, Turn, River)
     hand_strength = evaluate_postflop(obs)
     
-    # Adjust for aggressive opponents
-    opp_aggro = (memory.get("opp_raises", 0) / max(1, memory.get("hands_played", 1))) > 0.4
-    if opp_aggro:
-        hand_strength *= 0.90  # Slightly tighter against aggression
-
     # Monster hands -> Value Raise / Jam
     if hand_strength >= 0.80:
         if Action.RAISE_POT in legal:
@@ -210,6 +212,11 @@ def choose_action(obs: Observation, memory: dict) -> Action:
             return Action.CHECK_CALL
 
     # Medium hands -> Check/Call reasonable bets
+    if to_call > 0 and hand_strength < 0.60:
+        if estimate_equity(obs) >= max(0.42, pot_odds + 0.10):
+            return Action.CHECK_CALL
+        return Action.FOLD
+
     if hand_strength >= 0.40:
         if to_call == 0:
             return Action.CHECK_CALL
@@ -223,10 +230,7 @@ def choose_action(obs: Observation, memory: dict) -> Action:
 
 
 def on_hand_end(result: HandResult, memory: dict) -> None:
-    """Track opponent action patterns to refine play style."""
-    memory["hands_played"] += 1
-    if result.winner == "me" and not result.went_to_showdown:
-        memory["opp_folds"] += 1
+    """The current strategy does not learn from completed hands."""
 
 # ===== END OF YOUR CODE =====
 
@@ -322,4 +326,3 @@ async def route_hand_end(request: Request):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5008"))
     uvicorn.run(app, host="0.0.0.0", port=port, log_level="info", access_log=False)
-    
